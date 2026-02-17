@@ -68,3 +68,6 @@ def home():
     return "Bot is running", 200
 
 threading.Thread(target=worker, daemon=True).start()
+@app.route("/")
+def home():
+    return "Bot is running", 200
