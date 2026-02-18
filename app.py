@@ -8,45 +8,49 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-ALERTS_TOKEN = os.getenv("ALERTS_TOKEN")
+TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+ALERTS_TOKEN = os.getenv("ALERTS_TOKEN", "").strip()
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 API_URL = "https://api.alerts.in.ua/v1/alerts/active.json"
 
 KEYWORDS = ["одеса", "м. одеса", "одеська міська", "одеська громада"]
 
-# --- тестовий режим
+# --- глобальний стан для тесту
 FORCE_STATE = None  # None = реальні дані, True = тривога, False = відбій
 
-# --- стан для статусу/тривалості
-last_state = None
-alert_start_time = None
-last_check_ts = None
-
+# --- глобальний стан воркера (для /status)
+STATE = {
+    "last_state": None,
+    "alert_start_time": None,
+    "last_check_ts": None,
+    "last_error": None,
+}
 
 def send_telegram(text: str) -> bool:
+    """Надсилає в телеграм. Повертає True/False."""
     if not TG_TOKEN or not TG_CHAT_ID:
-        print("Missing TG_TOKEN or TG_CHAT_ID")
+        STATE["last_error"] = "TG_TOKEN або TG_CHAT_ID не задані"
         return False
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=20)
-        ok = r.ok
-        if not ok:
-            print("Telegram send failed:", r.status_code, r.text)
-        return ok
+        if r.status_code != 200:
+            STATE["last_error"] = f"Telegram HTTP {r.status_code}: {r.text[:200]}"
+            return False
+        return True
     except Exception as e:
-        print("Telegram send exception:", e)
+        STATE["last_error"] = f"Telegram error: {e}"
         return False
 
-
 def fetch_alerts():
+    if not ALERTS_TOKEN:
+        raise RuntimeError("ALERTS_TOKEN не заданий")
     r = requests.get(API_URL, params={"token": ALERTS_TOKEN}, timeout=20)
+    r.raise_for_status()
     return r.json()
-
 
 def is_odessa_alert(alert: dict) -> bool:
     if str(alert.get("alert_type", "")).lower() != "air_raid":
@@ -60,133 +64,120 @@ def is_odessa_alert(alert: dict) -> bool:
 
     return any(word in title for word in KEYWORDS)
 
-
-def format_duration_seconds(seconds: int) -> str:
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
+def format_duration(duration):
+    total_seconds = int(duration.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
     if hours > 0:
-        return f"{hours} год {minutes} хв {secs} с"
-    if minutes > 0:
-        return f"{minutes} хв {secs} с"
-    return f"{secs} с"
+        return f"{hours} год {minutes} хв"
+    return f"{minutes} хв"
 
+def apply_state(active: bool, reason: str = ""):
+    """Єдина логіка переходів станів + відправка повідомлень."""
+    last_state = STATE["last_state"]
+
+    # перший запуск — просто запам'ятали стан
+    if last_state is None:
+        STATE["last_state"] = active
+        if active:
+            STATE["alert_start_time"] = datetime.now()
+        return
+
+    # перехід: відбій -> тривога
+    if active and not last_state:
+        start_time = datetime.now()
+        STATE["alert_start_time"] = start_time
+        ok = send_telegram(
+            f"🚨 Одеса: ПОВІТРЯНА ТРИВОГА\n🕒 {start_time.strftime('%H:%M:%S')}"
+            + (f"\n({reason})" if reason else "")
+        )
+        STATE["last_state"] = True
+        return ok
+
+    # перехід: тривога -> відбій
+    if (not active) and last_state:
+        end_time = datetime.now()
+        start_time = STATE["alert_start_time"] or end_time
+        duration = end_time - start_time
+        ok = send_telegram(
+            f"✅ Одеса: ВІДБІЙ\n⏱ Тривала: {format_duration(duration)}"
+            + (f"\n({reason})" if reason else "")
+        )
+        STATE["last_state"] = False
+        STATE["alert_start_time"] = None
+        return ok
+
+    # стан не змінився
+    return None
 
 def worker():
-    global FORCE_STATE, last_state, alert_start_time, last_check_ts
-
+    global FORCE_STATE
     while True:
         try:
-            last_check_ts = time.time()
-
-            # 1) визначаємо active
+            # визначаємо active
             if FORCE_STATE is not None:
                 active = bool(FORCE_STATE)
+                apply_state(active, reason="TEST MODE")
             else:
                 data = fetch_alerts()
                 alerts = data.get("alerts", data if isinstance(data, list) else [])
                 active = any(isinstance(a, dict) and is_odessa_alert(a) for a in alerts)
+                apply_state(active)
 
-            # 2) логіка переходів
-            if last_state is None:
-                # перший запуск — фіксуємо стан, але не спамимо
-                last_state = active
-                if active:
-                    alert_start_time = datetime.now()
-
-            elif active and not last_state:
-                alert_start_time = datetime.now()
-                send_telegram(
-                    f"🚨 Одеса: ПОВІТРЯНА ТРИВОГА\n🕒 {alert_start_time.strftime('%H:%M:%S')}"
-                )
-                last_state = True
-
-            elif (not active) and last_state:
-                end_time = datetime.now()
-                if alert_start_time is None:
-                    # якщо з якоїсь причини старту нема — просто відбій без тривалості
-                    send_telegram(f"✅ Одеса: ВІДБІЙ\n🕒 {end_time.strftime('%H:%M:%S')}")
-                else:
-                    duration_s = int((end_time - alert_start_time).total_seconds())
-                    send_telegram(
-                        f"✅ Одеса: ВІДБІЙ\n⏱ Тривала: {format_duration_seconds(duration_s)}"
-                    )
-
-                last_state = False
-                alert_start_time = None
+            STATE["last_check_ts"] = time.time()
+            STATE["last_error"] = None
 
         except Exception as e:
-            print("Worker error:", e)
+            STATE["last_error"] = str(e)
 
         time.sleep(POLL_SECONDS)
 
-
 @app.route("/")
 def home():
-    return "Bot is running", 200
+    return "Bot is running. Use /health, /status, /test/on, /test/off, /test/auto", 200
 
+@app.route("/health")
+def health():
+    return "OK", 200
 
 @app.route("/status")
 def status():
-    now_ts = time.time()
-    return jsonify(
-        ok=True,
-        force_state=FORCE_STATE,
-        last_state=last_state,
-        alert_start_time=alert_start_time.isoformat() if alert_start_time else None,
-        seconds_since_last_check=int(now_ts - last_check_ts) if last_check_ts else None,
-    )
+    now = time.time()
+    seconds_since = None if STATE["last_check_ts"] is None else int(now - STATE["last_check_ts"])
+    return jsonify({
+        "ok": True,
+        "force_state": FORCE_STATE,
+        "last_state": STATE["last_state"],
+        "alert_start_time": None if STATE["alert_start_time"] is None else STATE["alert_start_time"].isoformat(),
+        "seconds_since_last_check": seconds_since,
+        "last_error": STATE["last_error"],
+    })
 
-
-# --- ТЕСТ: одразу шле повідомлення + ставить FORCE_STATE ---
+# --- ТЕСТОВІ КНОПКИ (ОДРАЗУ ШЛЮТЬ ПОВІДОМЛЕННЯ) ---
 @app.route("/test/on")
 def test_on():
-    global FORCE_STATE, last_state, alert_start_time
+    global FORCE_STATE
     FORCE_STATE = True
-
-    # якщо ще не було тривоги — зафіксувати старт і надіслати
-    if last_state is not True:
-        alert_start_time = datetime.now()
-        sent = send_telegram(
-            f"🧪 ТЕСТ\n🚨 Одеса: ПОВІТРЯНА ТРИВОГА\n🕒 {alert_start_time.strftime('%H:%M:%S')}"
-        )
-        last_state = True
-    else:
-        sent = send_telegram("🧪 ТЕСТ\n🚨 Тривога вже активна")
-    return jsonify(force="ON", sent=sent), 200
-
+    res = apply_state(True, reason="MANUAL TEST /test/on")
+    return jsonify({"force": "ON", "sent": bool(res)}), 200
 
 @app.route("/test/off")
 def test_off():
-    global FORCE_STATE, last_state, alert_start_time
+    global FORCE_STATE
     FORCE_STATE = False
-
-    end_time = datetime.now()
-    if last_state is True and alert_start_time:
-        duration_s = int((end_time - alert_start_time).total_seconds())
-        sent = send_telegram(
-            f"🧪 ТЕСТ\n✅ Одеса: ВІДБІЙ\n⏱ Тривала: {format_duration_seconds(duration_s)}"
-        )
-    else:
-        sent = send_telegram(f"🧪 ТЕСТ\n✅ Одеса: ВІДБІЙ\n🕒 {end_time.strftime('%H:%M:%S')}")
-
-    last_state = False
-    alert_start_time = None
-    return jsonify(force="OFF", sent=sent), 200
-
+    res = apply_state(False, reason="MANUAL TEST /test/off")
+    return jsonify({"force": "OFF", "sent": bool(res)}), 200
 
 @app.route("/test/auto")
 def test_auto():
     global FORCE_STATE
     FORCE_STATE = None
-    sent = send_telegram("🧪 ТЕСТ\n🔁 Повернувся до реальних тривог (API)")
-    return jsonify(force="AUTO", sent=sent), 200
+    return jsonify({"force": "AUTO"}), 200
 
-
-@app.route("/test/ping")
-def test_ping():
-    sent = send_telegram("🧪 ПІНГ: бот живий ✅")
-    return jsonify(ok=True, sent=sent), 200
-
-
+# старт воркера
 threading.Thread(target=worker, daemon=True).start()
+
+# ✅ ВАЖЛИВО: запуск веб-сервера для Render
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
