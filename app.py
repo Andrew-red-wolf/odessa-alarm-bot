@@ -4,54 +4,51 @@ import threading
 from datetime import datetime
 
 import requests
-from flask import Flask
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ====== ENV ======
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-ALERTS_TOKEN = os.getenv("ALERTS_TOKEN")
+TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+ALERTS_TOKEN = os.getenv("ALERTS_TOKEN", "").strip()
 
-# ====== SETTINGS ======
-POLL_SECONDS = 30
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 API_URL = "https://api.alerts.in.ua/v1/alerts/active.json"
 
-# Під Одесу / Одеську міську громаду (можна доповнювати)
-KEYWORDS = ["одеса", "м. одеса", "одеська міська", "одеська громада", "одеська міська громада"]
+KEYWORDS = ["одеса", "м. одеса", "одеська міська", "одеська громада"]
 
-# ====== STATE ======
-LAST_STATE = None
-ALERT_START_TIME = None
+# Файл для тестового режиму (працює навіть якщо в тебе 2+ процеси на Render)
+FORCE_FILE = "/tmp/force_state.txt"
+# Значення: "ON", "OFF", або файл відсутній = AUTO
 
 
 def send_telegram(text: str):
-    """Надіслати повідомлення в Telegram."""
+    """Надіслати повідомлення в Telegram + показати помилки в логах Render."""
     if not TG_TOKEN or not TG_CHAT_ID:
-        print("TG_TOKEN or TG_CHAT_ID is missing")
-        return
+        print("ERROR: TG_TOKEN or TG_CHAT_ID is empty")
+        return False
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=20)
-        if r.status_code != 200:
-            print("Telegram error:", r.status_code, r.text)
+        resp = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=20)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text}
+
+        print("TG RESP:", data)  # <-- найважливіше, буде видно причину якщо не відправляє
+        return bool(data.get("ok"))
     except Exception as e:
-        print("Telegram send exception:", e)
+        print("TG ERROR:", e)
+        return False
 
 
 def fetch_alerts():
-    """Забрати активні тривоги з alerts.in.ua."""
-    if not ALERTS_TOKEN:
-        raise RuntimeError("ALERTS_TOKEN is missing")
-
     r = requests.get(API_URL, params={"token": ALERTS_TOKEN}, timeout=20)
-    r.raise_for_status()
     return r.json()
 
 
 def is_odessa_alert(alert: dict) -> bool:
-    """Фільтр: тільки повітряна тривога по Одеській області і з назвою під Одесу/громаду."""
     if str(alert.get("alert_type", "")).lower() != "air_raid":
         return False
 
@@ -64,60 +61,71 @@ def is_odessa_alert(alert: dict) -> bool:
     return any(word in title for word in KEYWORDS)
 
 
-def format_duration(duration):
-    """Формат тривалості: 'X год Y хв' або 'Y хв'."""
-    total_seconds = int(duration.total_seconds())
-    if total_seconds < 0:
-        total_seconds = 0
+def read_force_state():
+    """Повертає True/False/None (None = AUTO)."""
+    try:
+        with open(FORCE_FILE, "r", encoding="utf-8") as f:
+            v = f.read().strip().upper()
+        if v == "ON":
+            return True
+        if v == "OFF":
+            return False
+        return None
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print("FORCE READ ERROR:", e)
+        return None
 
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
 
-    if hours > 0:
-        return f"{hours} год {minutes} хв"
-    return f"{minutes} хв"
+def format_duration(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h} год {m} хв {s} с"
+    if m > 0:
+        return f"{m} хв {s} с"
+    return f"{s} с"
 
 
 def worker():
-    """Основний цикл: слідкує за станом тривоги і шле повідомлення при зміні."""
-    global LAST_STATE, ALERT_START_TIME
+    last_state = None
+    alert_start_time = None
 
     while True:
         try:
-            data = fetch_alerts()
-            alerts = data.get("alerts", data if isinstance(data, list) else [])
+            forced = read_force_state()
 
-            active = any(isinstance(a, dict) and is_odessa_alert(a) for a in alerts)
+            if forced is not None:
+                active = forced
+            else:
+                data = fetch_alerts()
+                alerts = data.get("alerts", data if isinstance(data, list) else [])
+                active = any(isinstance(a, dict) and is_odessa_alert(a) for a in alerts)
 
-            if LAST_STATE is None:
-                # ініціалізація без спаму
-                LAST_STATE = active
+            if last_state is None:
+                last_state = active
                 if active:
-                    ALERT_START_TIME = datetime.now()
+                    alert_start_time = datetime.now()
 
-            elif active and not LAST_STATE:
-                # старт тривоги
-                ALERT_START_TIME = datetime.now()
-                send_telegram(
-                    f"🚨 Одеса: ПОВІТРЯНА ТРИВОГА\n🕒 {ALERT_START_TIME.strftime('%H:%M:%S')}"
-                )
-                LAST_STATE = True
+            elif active and not last_state:
+                alert_start_time = datetime.now()
+                send_telegram(f"🚨 Одеса: ПОВІТРЯНА ТРИВОГА\n🕒 {alert_start_time.strftime('%H:%M:%S')}")
+                last_state = True
 
-            elif (not active) and LAST_STATE:
-                # відбій
+            elif (not active) and last_state:
                 end_time = datetime.now()
-                if ALERT_START_TIME is None:
-                    ALERT_START_TIME = end_time
-
-                duration = end_time - ALERT_START_TIME
-                send_telegram(
-                    f"✅ Одеса: ВІДБІЙ\n⏱ Тривала: {format_duration(duration)}"
-                )
-                LAST_STATE = False
-                ALERT_START_TIME = None
+                if alert_start_time:
+                    dur_s = int((end_time - alert_start_time).total_seconds())
+                else:
+                    dur_s = 0
+                send_telegram(f"✅ Одеса: ВІДБІЙ\n⏱ Тривала: {format_duration(dur_s)}")
+                last_state = False
+                alert_start_time = None
 
         except Exception as e:
-            print("Worker error:", e)
+            print("WORKER ERROR:", e)
 
         time.sleep(POLL_SECONDS)
 
@@ -127,39 +135,40 @@ def home():
     return "Bot is running", 200
 
 
-# ====== TEST ROUTES (НЕ залежать від worker і не ламаються через кілька воркерів gunicorn) ======
+# --- ТЕСТОВІ РУЧКИ (працюють стабільно) ---
+
+@app.route("/test/ping")
+def test_ping():
+    ok = send_telegram("✅ TEST: ping (перевірка звʼязку)")
+    return jsonify({"ok": ok}), 200
+
+
 @app.route("/test/on")
 def test_on():
-    global LAST_STATE, ALERT_START_TIME
-    ALERT_START_TIME = datetime.now()
-    LAST_STATE = True
-    send_telegram(f"🧪 ТЕСТ: ТРИВОГА\n🕒 {ALERT_START_TIME.strftime('%H:%M:%S')}")
-    return "Sent TEST ON to Telegram.", 200
+    with open(FORCE_FILE, "w", encoding="utf-8") as f:
+        f.write("ON")
+    # НЕ чекаємо 30 сек — одразу шлемо тестове
+    ok = send_telegram("🚨 TEST: FORCE ON (імітація тривоги)")
+    return jsonify({"force": "ON", "sent": ok}), 200
 
 
 @app.route("/test/off")
 def test_off():
-    global LAST_STATE, ALERT_START_TIME
-    end_time = datetime.now()
-
-    if ALERT_START_TIME is None:
-        ALERT_START_TIME = end_time
-
-    duration = end_time - ALERT_START_TIME
-    LAST_STATE = False
-    ALERT_START_TIME = None
-
-    send_telegram(f"🧪 ТЕСТ: ВІДБІЙ\n⏱ Тривала: {format_duration(duration)}")
-    return "Sent TEST OFF to Telegram.", 200
+    with open(FORCE_FILE, "w", encoding="utf-8") as f:
+        f.write("OFF")
+    ok = send_telegram("✅ TEST: FORCE OFF (імітація відбою)")
+    return jsonify({"force": "OFF", "sent": ok}), 200
 
 
-@app.route("/test/reset")
-def test_reset():
-    global LAST_STATE, ALERT_START_TIME
-    LAST_STATE = None
-    ALERT_START_TIME = None
-    return "State reset OK.", 200
+@app.route("/test/auto")
+def test_auto():
+    try:
+        os.remove(FORCE_FILE)
+    except FileNotFoundError:
+        pass
+    ok = send_telegram("🔄 TEST: AUTO (назад до реальних тривог)")
+    return jsonify({"force": "AUTO", "sent": ok}), 200
 
 
-# Запуск фонового потоку
+# старт потоку
 threading.Thread(target=worker, daemon=True).start()
