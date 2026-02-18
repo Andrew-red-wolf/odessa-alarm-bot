@@ -17,14 +17,8 @@ ALERTS_TOKEN = os.getenv("ALERTS_TOKEN")
 POLL_SECONDS = 30
 API_URL = "https://api.alerts.in.ua/v1/alerts/active.json"
 
-# Під Одесу/Одеську міську громаду (можна доповнювати)
+# Під Одесу / Одеську міську громаду (можна доповнювати)
 KEYWORDS = ["одеса", "м. одеса", "одеська міська", "одеська громада", "одеська міська громада"]
-
-# ====== TEST SWITCH ======
-# None = реальні дані з alerts.in.ua
-# True = примусово "тривога"
-# False = примусово "відбій"
-FORCE_STATE = None
 
 # ====== STATE ======
 LAST_STATE = None
@@ -32,6 +26,7 @@ ALERT_START_TIME = None
 
 
 def send_telegram(text: str):
+    """Надіслати повідомлення в Telegram."""
     if not TG_TOKEN or not TG_CHAT_ID:
         print("TG_TOKEN or TG_CHAT_ID is missing")
         return
@@ -46,6 +41,7 @@ def send_telegram(text: str):
 
 
 def fetch_alerts():
+    """Забрати активні тривоги з alerts.in.ua."""
     if not ALERTS_TOKEN:
         raise RuntimeError("ALERTS_TOKEN is missing")
 
@@ -55,22 +51,21 @@ def fetch_alerts():
 
 
 def is_odessa_alert(alert: dict) -> bool:
-    # Тип тривоги: повітряна
+    """Фільтр: тільки повітряна тривога по Одеській області і з назвою під Одесу/громаду."""
     if str(alert.get("alert_type", "")).lower() != "air_raid":
         return False
 
     title = str(alert.get("location_title", "")).lower()
     oblast = str(alert.get("location_oblast", "")).lower()
 
-    # тільки Одеська область
     if "одесь" not in oblast:
         return False
 
-    # фільтр саме під місто/громаду
     return any(word in title for word in KEYWORDS)
 
 
 def format_duration(duration):
+    """Формат тривалості: 'X год Y хв' або 'Y хв'."""
     total_seconds = int(duration.total_seconds())
     if total_seconds < 0:
         total_seconds = 0
@@ -84,25 +79,24 @@ def format_duration(duration):
 
 
 def worker():
-    global FORCE_STATE, LAST_STATE, ALERT_START_TIME
+    """Основний цикл: слідкує за станом тривоги і шле повідомлення при зміні."""
+    global LAST_STATE, ALERT_START_TIME
 
     while True:
         try:
-            # 1) Визначаємо active
-            if FORCE_STATE is not None:
-                active = bool(FORCE_STATE)
-            else:
-                data = fetch_alerts()
-                alerts = data.get("alerts", data if isinstance(data, list) else [])
-                active = any(isinstance(a, dict) and is_odessa_alert(a) for a in alerts)
+            data = fetch_alerts()
+            alerts = data.get("alerts", data if isinstance(data, list) else [])
 
-            # 2) Логіка переходів
+            active = any(isinstance(a, dict) and is_odessa_alert(a) for a in alerts)
+
             if LAST_STATE is None:
+                # ініціалізація без спаму
                 LAST_STATE = active
                 if active:
                     ALERT_START_TIME = datetime.now()
 
             elif active and not LAST_STATE:
+                # старт тривоги
                 ALERT_START_TIME = datetime.now()
                 send_telegram(
                     f"🚨 Одеса: ПОВІТРЯНА ТРИВОГА\n🕒 {ALERT_START_TIME.strftime('%H:%M:%S')}"
@@ -110,9 +104,10 @@ def worker():
                 LAST_STATE = True
 
             elif (not active) and LAST_STATE:
+                # відбій
                 end_time = datetime.now()
                 if ALERT_START_TIME is None:
-                    ALERT_START_TIME = end_time  # на всяк випадок
+                    ALERT_START_TIME = end_time
 
                 duration = end_time - ALERT_START_TIME
                 send_telegram(
@@ -132,31 +127,39 @@ def home():
     return "Bot is running", 200
 
 
-# ====== TEST ROUTES ======
+# ====== TEST ROUTES (НЕ залежать від worker і не ламаються через кілька воркерів gunicorn) ======
 @app.route("/test/on")
 def test_on():
-    global FORCE_STATE, LAST_STATE, ALERT_START_TIME
-    FORCE_STATE = True
-    LAST_STATE = False
-    ALERT_START_TIME = None
-    return "Test ON set (forced alarm). Wait up to 30s.", 200
+    global LAST_STATE, ALERT_START_TIME
+    ALERT_START_TIME = datetime.now()
+    LAST_STATE = True
+    send_telegram(f"🧪 ТЕСТ: ТРИВОГА\n🕒 {ALERT_START_TIME.strftime('%H:%M:%S')}")
+    return "Sent TEST ON to Telegram.", 200
 
 
 @app.route("/test/off")
 def test_off():
-    global FORCE_STATE, LAST_STATE
-    FORCE_STATE = False
-    LAST_STATE = True
-    return "Test OFF set (forced all-clear). Wait up to 30s.", 200
+    global LAST_STATE, ALERT_START_TIME
+    end_time = datetime.now()
+
+    if ALERT_START_TIME is None:
+        ALERT_START_TIME = end_time
+
+    duration = end_time - ALERT_START_TIME
+    LAST_STATE = False
+    ALERT_START_TIME = None
+
+    send_telegram(f"🧪 ТЕСТ: ВІДБІЙ\n⏱ Тривала: {format_duration(duration)}")
+    return "Sent TEST OFF to Telegram.", 200
 
 
-@app.route("/test/auto")
-def test_auto():
-    global FORCE_STATE, LAST_STATE, ALERT_START_TIME
-    FORCE_STATE = None
+@app.route("/test/reset")
+def test_reset():
+    global LAST_STATE, ALERT_START_TIME
     LAST_STATE = None
     ALERT_START_TIME = None
-    return "Back to real alerts (FORCE_STATE=None).", 200
+    return "State reset OK.", 200
 
 
+# Запуск фонового потоку
 threading.Thread(target=worker, daemon=True).start()
