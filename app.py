@@ -40,8 +40,20 @@ def is_odessa_alert(alert):
 
     return any(word in title for word in KEYWORDS)
 
+def format_duration(duration):
+    total_seconds = int(duration.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+
+    if hours > 0:
+        return f"{hours} год {minutes} хв"
+    else:
+        return f"{minutes} хв"
+
 def worker():
     last_state = None
+    alert_start_time = None
+
     while True:
         try:
             data = fetch_alerts()
@@ -51,12 +63,27 @@ def worker():
 
             if last_state is None:
                 last_state = active
+                if active:
+                    alert_start_time = datetime.now()
+
             elif active and not last_state:
-                send_telegram(f"🚨 Одеса: ПОВІТРЯНА ТРИВОГА\n{now()}")
+                alert_start_time = datetime.now()
+                send_telegram(
+                    f"🚨 Одеса: ПОВІТРЯНА ТРИВОГА\n🕒 {alert_start_time.strftime('%H:%M:%S')}"
+                )
                 last_state = True
+
             elif not active and last_state:
-                send_telegram(f"✅ Одеса: ВІДБІЙ\n{now()}")
+                end_time = datetime.now()
+                duration = end_time - alert_start_time
+
+                send_telegram(
+                    f"✅ Одеса: ВІДБІЙ\n"
+                    f"⏱ Тривала: {format_duration(duration)}"
+                )
+
                 last_state = False
+                alert_start_time = None
 
         except Exception as e:
             print("Error:", e)
@@ -68,6 +95,3 @@ def home():
     return "Bot is running", 200
 
 threading.Thread(target=worker, daemon=True).start()
-@app.route("/")
-def home():
-    return "Bot is running", 200
