@@ -2,171 +2,226 @@ import os
 import time
 import threading
 from datetime import datetime
-
 import requests
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-TG_TOKEN = os.getenv("TG_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-ALERTS_TOKEN = os.getenv("ALERTS_TOKEN", "")
+# ===== ENV VARS =====
+TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()  # group id like -100xxxxxxxxxx
+ALERTS_TOKEN = os.getenv("ALERTS_TOKEN", "").strip()
 
+# ===== SETTINGS =====
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+HEARTBEAT_HOUR = int(os.getenv("HEARTBEAT_HOUR", "9"))  # 09:00
+TIMEZONE_LABEL = os.getenv("TIMEZONE_LABEL", "Europe/Kyiv")  # just label in text
+
 API_URL = "https://api.alerts.in.ua/v1/alerts/active.json"
 
-KEYWORDS = ["одеса", "м. одеса", "одеська міська", "одеська громада"]
+# Keywords for Odessa / Odesa region (alerts.in.ua titles can vary)
+KEYWORDS = [
+    "одеса", "м. одеса", "м одеса", "одеська", "одеська громада", "одеський",
+    "odesa", "odessa"
+]
 
-# None = робота по API, True = тривога, False = відбій
-FORCE_STATE = None
-
-# для статусу
-last_state = None
-alert_start_time = None
+# State
+last_state = None           # True = alert, False = no alert
+alert_start_time = None     # when alert started
+last_check_ts = None        # last poll time
 last_error = None
-last_check_ts = 0
+last_heartbeat_date = None  # "dd.mm.yyyy"
+
+force_state = None          # None / True / False
 
 
-def tg_url(method: str) -> str:
-    return f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
+def now_time():
+    return datetime.now().strftime("%H:%M:%S")
 
 
-def send_telegram(text: str):
-    """
-    Повертає (ok: bool, info: dict)
-    """
+def today_date():
+    return datetime.now().strftime("%d.%m.%Y")
+
+
+def send_telegram(text: str) -> bool:
+    """Send message to telegram chat."""
     global last_error
     if not TG_TOKEN or not TG_CHAT_ID:
         last_error = "Missing TG_TOKEN or TG_CHAT_ID"
-        return False, {"error": last_error}
+        return False
 
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        r = requests.post(
-            tg_url("sendMessage"),
-            json={"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": True},
-            timeout=20,
-        )
+        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=15)
+        if r.status_code != 200:
+            last_error = f"Telegram sendMessage HTTP {r.status_code}: {r.text[:200]}"
+            return False
+
         data = r.json()
-        if not data.get("ok"):
-            # тут буде реальна причина: chat not found / forbidden / etc.
-            last_error = f"Telegram error: {data}"
-            return False, data
-        return True, data
+        if not data.get("ok", False):
+            last_error = f"Telegram sendMessage not ok: {str(data)[:200]}"
+            return False
+
+        return True
     except Exception as e:
         last_error = f"Telegram exception: {e}"
-        return False, {"exception": str(e)}
+        return False
 
 
 def fetch_alerts():
+    """Fetch active alerts from alerts.in.ua API."""
+    global last_error
     if not ALERTS_TOKEN:
-        raise RuntimeError("Missing ALERTS_TOKEN")
-    r = requests.get(API_URL, params={"token": ALERTS_TOKEN}, timeout=20)
-    return r.json()
+        last_error = "Missing ALERTS_TOKEN"
+        return []
+
+    try:
+        r = requests.get(API_URL, params={"token": ALERTS_TOKEN}, timeout=20)
+        if r.status_code != 200:
+            last_error = f"alerts.in.ua HTTP {r.status_code}: {r.text[:200]}"
+            return []
+
+        data = r.json()
+        # API sometimes returns {"alerts":[...]} or a list directly
+        if isinstance(data, dict) and "alerts" in data:
+            return data["alerts"]
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        last_error = f"alerts.in.ua exception: {e}"
+        return []
 
 
-def is_odessa_alert(alert: dict) -> bool:
-    if str(alert.get("alert_type", "")).lower() != "air_raid":
+def is_odessa_air_alert(alert: dict) -> bool:
+    """Detect Odessa air raid alert."""
+    try:
+        # Some APIs have alert_type or type; keep it flexible
+        a_type = str(alert.get("alert_type", alert.get("type", ""))).lower()
+        if "air" not in a_type and "повіт" not in a_type and "raid" not in a_type:
+            # If API doesn't provide type reliably, don't hard-fail
+            # We'll still try to match by oblast/title
+            pass
+
+        oblast = str(alert.get("location_oblast", alert.get("oblast", ""))).lower()
+        title = str(alert.get("location_title", alert.get("title", ""))).lower()
+
+        # Must be Odessa oblast
+        if "одес" not in oblast and "odes" not in oblast:
+            return False
+
+        # Title should mention Odessa city/community or relevant keyword
+        return any(k in title for k in KEYWORDS) or ("одес" in title) or ("odes" in title)
+    except Exception:
         return False
 
-    title = str(alert.get("location_title", "")).lower()
-    oblast = str(alert.get("location_oblast", "")).lower()
 
-    if "одесь" not in oblast:
+def get_active_state() -> bool:
+    """Return True if Odessa air alert is active."""
+    # forced state has priority
+    if force_state is True:
+        return True
+    if force_state is False:
         return False
 
-    return any(word in title for word in KEYWORDS)
+    alerts = fetch_alerts()
+    return any(isinstance(a, dict) and is_odessa_air_alert(a) for a in alerts)
 
 
-def format_duration(duration):
-    total_seconds = int(duration.total_seconds())
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    if hours > 0:
-        return f"{hours} год {minutes} хв"
-    return f"{minutes} хв"
-
-
-def worker():
-    global FORCE_STATE, last_state, alert_start_time, last_check_ts, last_error
+def worker_loop():
+    """Background loop: check alerts and heartbeat."""
+    global last_state, alert_start_time, last_check_ts, last_heartbeat_date
 
     while True:
         try:
             last_check_ts = int(time.time())
 
-            # режим тесту
-            if FORCE_STATE is not None:
-                active = bool(FORCE_STATE)
-            else:
-                data = fetch_alerts()
-                alerts = data.get("alerts", data if isinstance(data, list) else [])
-                active = any(isinstance(a, dict) and is_odessa_alert(a) for a in alerts)
+            # Heartbeat once per day at HEARTBEAT_HOUR
+            dt = datetime.now()
+            if dt.hour == HEARTBEAT_HOUR and last_heartbeat_date != today_date():
+                send_telegram(f"🟢 IZTalarm: бот активний\nДата: {today_date()} ({TIMEZONE_LABEL})")
+                last_heartbeat_date = today_date()
 
-            # логіка сповіщень
+            active = get_active_state()
+
             if last_state is None:
                 last_state = active
                 if active:
-                    alert_start_time = datetime.now()
+                    alert_start_time = datetime.now().isoformat()
+                # don't spam on first start
+            else:
+                # Rising edge: OFF -> ON
+                if active and not last_state:
+                    alert_start_time = datetime.now().isoformat()
+                    send_telegram(f"🚨 Одеса: ПОВІТРЯНА ТРИВОГА\nЧас: {now_time()}")
+                    last_state = True
 
-            elif active and not last_state:
-                alert_start_time = datetime.now()
-                send_telegram(f"🚨 Одеса: ПОВІТРЯНА ТРИВОГА\n🕒 {alert_start_time.strftime('%H:%M:%S')}")
-                last_state = True
-
-            elif (not active) and last_state:
-                end_time = datetime.now()
-                duration = end_time - (alert_start_time or end_time)
-                send_telegram(f"✅ Одеса: ВІДБІЙ\n⏱ Тривала: {format_duration(duration)}")
-                last_state = False
-                alert_start_time = None
-
-            last_error = None
+                # Falling edge: ON -> OFF
+                elif (not active) and last_state:
+                    send_telegram(f"✅ Одеса: ВІДБІЙ\nЧас: {now_time()}")
+                    last_state = False
+                    alert_start_time = None
 
         except Exception as e:
-            last_error = f"Worker exception: {e}"
+            # keep loop alive
+            print("Worker error:", e)
 
         time.sleep(POLL_SECONDS)
 
 
+# Start background thread
+threading.Thread(target=worker_loop, daemon=True).start()
+
+
+# ===== ROUTES =====
 @app.route("/")
 def home():
-    return "Bot is running", 200
+    return "OK", 200
 
 
-@app.route("/status")
-def status():
-    now = int(time.time())
+@app.route("/ping")
+def ping():
     return jsonify({
         "ok": True,
-        "tg_chat_id": TG_CHAT_ID,
-        "force_state": FORCE_STATE,
         "last_state": last_state,
-        "alert_start_time": alert_start_time.isoformat() if alert_start_time else None,
-        "last_error": last_error,
-        "seconds_since_last_check": (now - last_check_ts) if last_check_ts else None,
-    })
+        "force_state": force_state,
+        "alert_start_time": alert_start_time,
+        "seconds_since_last_check": None if not last_check_ts else int(time.time()) - last_check_ts,
+        "last_error": last_error
+    }), 200
 
 
-@app.route("/test/on")
-def test_on():
-    global FORCE_STATE
-    FORCE_STATE = True
-    ok, info = send_telegram("🚨 ТЕСТ: ТРИВОГА (FORCE ON)")
-    return jsonify({"force": "ON", "sent": ok, "tg_response": info})
+@app.route("/test")
+def test():
+    ok = send_telegram(f"🧪 ТЕСТ: бот на звʼязку\nЧас: {now_time()}\nДата: {today_date()}")
+    return jsonify({"ok": ok}), 200
 
 
-@app.route("/test/off")
-def test_off():
-    global FORCE_STATE
-    FORCE_STATE = False
-    ok, info = send_telegram("✅ ТЕСТ: ВІДБІЙ (FORCE OFF)")
-    return jsonify({"force": "OFF", "sent": ok, "tg_response": info})
+@app.route("/force_on")
+def force_on():
+    global force_state
+    force_state = True
+    ok = send_telegram("🚨 (ТЕСТ) Примусово УВІМКНУВ тривогу")
+    return jsonify({"force": "ON", "sent": ok}), 200
 
 
-@app.route("/test/auto")
-def test_auto():
-    global FORCE_STATE
-    FORCE_STATE = None
-    return jsonify({"force": None, "ok": True})
+@app.route("/force_off")
+def force_off():
+    global force_state
+    force_state = False
+    ok = send_telegram("✅ (ТЕСТ) Примусово ВИМКНУВ тривогу")
+    return jsonify({"force": "OFF", "sent": ok}), 200
 
 
-threading.Thread(target=worker, daemon=True).start()
+@app.route("/force_clear")
+def force_clear():
+    global force_state
+    force_state = None
+    ok = send_telegram("🧼 (ТЕСТ) Примус вимкнено, повернувся в автоматичний режим")
+    return jsonify({"force": None, "sent": ok}), 200
+
+
+if __name__ == "__main__":
+    # Render provides PORT automatically sometimes; keep default 10000 for local
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
