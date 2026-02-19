@@ -160,7 +160,20 @@ def ok():
         "last_error": last_error,
         "seconds_since_last_check": since
     })
+@app.route("/ok")
+def ok():
+    return {
+        "ok": True,
+        "bot_token_set": bool(BOT_TOKEN),
+        "chat_id_set": bool(CHAT_ID),
+        "last_state": last_state,
+        "alert_start_time": alert_start_time
+    }
 
+@app.route("/test")
+def test():
+    send_message("✅ ТЕСТ: бот живий і може писати в групу.")
+    return {"ok": True}
 
 @app.route("/test")
 def test():
